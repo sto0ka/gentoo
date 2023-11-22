@@ -1,0 +1,1709 @@
+#!/bin/bash
+
+
+GET_ARCH="$(lscpu | grep -w '^Architecture' | sed 's/\s\s*/ /g' | cut -d ' ' -f 1 --complement | cut -d ' ' -f 1 -z)"
+
+if [ $(nproc) -eq 16 ] || [ $(nproc) -gt 16 ]; then
+  _PARALLEL_THREADS="\$((\$(nproc)+1))"
+elif [ $(nproc) -gt 4 ]; then
+  _PARALLEL_THREADS="\$((\$(nproc)-4))"
+elif [ $(nproc) -eq 4 ]; then
+  _PARALLEL_THREADS="\$((\$(nproc)-2))"
+elif [ $(nproc) -eq 2 ]; then
+  _PARALLEL_THREADS="\$((\$(nproc)-1))"
+fi
+
+case "${GET_ARCH}" in
+  x86_64)
+  ;;
+  
+  aarch64)
+  echo "Support for ${GET_ARCH} is planned."
+  ;;
+  
+  *)
+  echo "Support for ${GET_ARCH} is unavailable for this script at this time."
+  ;;
+esac
+
+if test -x "$(command -v pacman > /dev/null 2>&1)"; then
+  if ! test -x "$(command -v genfstab > /dev/null 2>&1)"; then
+    echo "Package 'arch-install-scripts' needs to be installed; please install it first."
+    return 1
+  fi
+  DISTRO="Arch-based"
+elif test -x "$(command -v emerge > /dev/null 2>&1)"; then
+  DISTRO="Gentoo-based"
+else
+  echo "Either an Arch-based or Gentoo-based distro is required to use this script."
+  return 1
+fi
+
+
+LRED='\033[01;31m'
+GREEN='\033[0;32m'
+LCYAN='\033[1;36m'
+LBLUE='\033[1;34m'
+LPURPLE='\033[0;35m'
+DGRAY='\033[1;30m'
+NC='\033[0m' # No Color
+
+MOUNT_LOCATION=/mnt/gentoo
+TIMEZONE=America/Chicago # Change this to your relevant timezone located in "/usr/share/zoneinfo"
+
+AUTODETECT_CPU_ARCH=true
+AUTODETECT_CPU_FLAGS=true
+
+# "march" and "mtune" needs to be configured based on what this command responds with:
+# gcc -march=native -Q --help=target | grep -- '-march=' | cut -f3 | cut -d ' ' -f 1 -z
+if [ ${AUTODETECT_CPU_ARCH} != false ]; then
+  echo "Setting CPU architecture"
+  CPU_ARCH="$(gcc -march=native -Q --help=target | grep -- '-march=' | cut -f3 | cut -d ' ' -f 1 -z)"
+fi
+CFLAGS="-march=${CPU_ARCH} -mtune-${CPU_ARCH} -O3 -pipe -fno-plt -pthread -fsanitize=bounds,alignment,object-size -fsanitize-undefined-trap-on-error \
+        -fvisibility=hidden -fexceptions -Wformat -Werror=format-security \
+        -Wvla -Wimplicit-fallthrough -Wno-unused-result -Wno-unneeded-internal-declaration -Warray-bounds"
+
+# We want the CPU_FLAGS given by "cpuid2cpuflags" - this implementation only supports x86/x86_64 right now
+if [ ${AUTODETECT_CPU_FLAGS} != false ]; then
+  echo "Installing cpuid2cpuflags"
+  case "${DISTRO}" in
+    "Arch-based")
+    if test -x "$( ! command -v cpuid2cpuflags > /dev/null 2>&1)"; then
+      echo "The 'cpuid2cpuflags' package is required to run this script."
+      echo "Please install it from the AUR before proceeding."
+      return 1
+    fi
+    ;;
+    "Gentoo-based")
+    emerge --oneshot --noreplace cpuid2cpuflags
+    ;;
+    *)
+    if test -x "$( ! command -v cpuid2cpuflags > /dev/null 2>&1)"; then
+      echo "Non-supported distro in-use; exiting."
+      return 1
+    fi
+    ;;
+  esac
+  echo "Setting CPU_FLAGS"
+  CPU_FLAGS=$(cpuid2cpuflags | cut -c 1-15 --complement)
+fi
+
+## Not entirely sure how enabling "32", "x32", "abi_x86_32" works; my lack of understanding about that may either cause Wine build errors or needlessly installed 32-bit libraries
+USE_FLAGS="a52 aac acpi branding cairo cdr dbus dri dts dvd dvdr encode exif flac gif gpm gui icu jpeg lcms libnotify mad mng mp3 mp4 mpeg ogg pdf png ppds spell startup-notification svg tiff truetype vorbis udev udisks unicode upower usb wxwidgets x264 xml xv xvid X xcb wayland acl bindist mmx sse sse2 initramfs redistributable elogind -suid -selinux xattr clang desktop-portal accessibility crypt bluetooth browser-integration sna pulseaudio pipewire pipewire-alsa policykit sysv-utils netifrc ncurses audit pam -systemd -test -examples layers vulkan opencl discord-presence mgba autotype browser keeshare network introspection zip steamruntime en-US d3d9 gles1 gles2 llvm lm-sensors opencl osmesa valgrind xa xvmc zink 64 32 x32 unwind vaapi zstd dist-kernel symlink fonts seccomp"
+MAKE_OPTIONS="-j${_PARALLEL_THREADS}"
+
+IS_SSD=true # Change to false if the target device is not an SSD drive
+IS_NVME=true # Change to false if the target device is not an NVME drive
+
+### These are the main values that need reviewed for installation; though, you can add post-install packages to 'LATE_PACKAGES' further below
+USE_KERNEL_CONFIG=$(read -n 1 -r -p "Use your own kernel .config file? - (y/n): ")
+if [ "${USE_KERNEL_CONFIG}" != n ]; then
+  USE_KERNEL_CONFIG=true
+else
+  USE_KERNEL_CONFIG=false
+fi
+
+# Use if your Intel CPU has an iGPU (most Intel CPUs have this; you'll probably already know if it doesn't, but if you don't look up your CPU name)
+INSTALL_INTEL_DRIVER=$(read -n 1 -r -p "Do you use an Intel CPU? - (y/n): ")
+if [ "${INSTALL_INTEL_DRIVER}" != n ]; then
+  INSTALL_INTEL_DRIVER=true
+else
+  INSTALL_INTEL_DRIVER=false
+fi
+
+USE_NVIDIA=$(read -n 1 -r -p "Do you use an Nvidia GPU? - (y/n): ")
+if  [ "${USE_NVIDIA}" != "n" ]; then
+  # Use this if you want to use the Nvidia proprietary driver - the "open modules" option below doesn't require this to be enabled
+  INSTALL_NVIDIA_DRIVER=$(read -n 1 -r -p "Do you use an Nvidia GPU and wish to use the official driver? - (y/n): ")
+  if [ "${INSTALL_NVIDIA_DRIVER}" != "n" ]; then
+    INSTALL_NVIDIA_DRIVER=true
+    
+    # Use this if you have an RTX or newer card and aren't afraid to report bugs to improve driver support: https://github.com/NVIDIA/open-gpu-kernel-modules
+    INSTALL_NVIDIA_OPEN_GPU_MODULES=$(read -n 1 -r -p "Use the open-source kernel modules (not the nouveau driver)? Requires RTX or newer. - (y/n): ")
+    if [ "${INSTALL_NVIDIA_OPEN_GPU_MODULES}" != "n" ]; then
+      INSTALL_NVIDIA_OPEN_GPU_MODULES=true
+    else
+      INSTALL_NVIDIA_OPEN_GPU_MODULES=false
+    fi
+    
+  else
+    INSTALL_NVIDIA_DRIVER=false
+    
+    # Use this if you either have a really old Nvidia card that the official drivers don't support or intend to contribute to the Nouveau project
+    INSTALL_NOUVEAU_DRIVER=$(read -n 1 -r -p "Do you use an Nvidia GPU and wish to use the FOSS driver? Support for this driver is limited. - (y/n): ")
+    if [ "${INSTALL_NOUVEAU_DRIVER}" != "n" ]; then
+      INSTALL_NOUVEAU_DRIVER=true
+    else
+      INSTALL_NOUVEAU_DRIVER=false
+    fi
+  fi
+fi
+
+# Use this if you either have an AMD GPU or AMD APU (AMD CPU with an iGPU)
+USE_RADEON=$(read -n 1 -r -p "Do you use an AMD GPU or APU/iGPU? - (y/n): ")
+if [ "${USE_RADEON}" != "n" ]; then
+  USE_RADEON=true
+else
+  USE_RADEON=false
+fi
+
+USED_VIDEO_CARDS="" ## Don't touch this!! This value is for the installer.
+
+
+## DO NOT add desktop environments to this list (if you know bash), only personal applications. (I set an example here: keep, add, or remove as desired.)
+# Desktop Environments and similar related applications (like file managers, associated terminals, and associated utilities) can be added manually in this script further down.
+# This is to encourage adding new desktop environment profiles to the script, as I only use KDE Plasma, and I know this isn't the case for everyone
+LATE_PACKAGES="app-shells/fish dev-util/rustup net-misc/croc app-misc/neofetch net-misc/axel dev-lang/mono virtual/dotnet-sdk games-util/lutris dev-vcs/git-lfs net-ftp/filezilla net-im/discord-bin media-gfx/blender media-video/obs-studio app-office/libreoffice games-fps/xonotic games-action/supertuxkart dev-util/shellcheck app-admin/hardinfo net-print/cups"
+### -------------------------------------------------------------
+
+### Make sure to make your own partitions; formatting is handled by the script
+## This script currently checks for NVME SSDs first, if available; reference "lsblk" for available devices if you want to change which SSD you want Gentoo installed to by either
+## changing all of the "nvme0n1" references to a different NVME drive or by setting "IS_NVME", above, to false if you don't want to install to an available NVME drive.
+## Similarly, this can be done for the middle "else" check to do the same for SATA SSDs
+
+
+if lsblk | grep -w '^nvme0n1' | cut -f3 | cut -d ' ' -f 1 > /dev/null 2>&1 && ${IS_SSD} != false && ${IS_NVME} != false || lsblk | grep -w '^nvme0n1' | cut -f3 | cut -d ' ' -f 1 > /dev/null 2>&1 && ${IS_SSD} != true && ${IS_NVME} != false; then ## Written this way as error handling
+  BOOT_PARTITION=/dev/nvme0n1p1
+  SWAP_PARTITION=/dev/nvme0n1p2
+  ROOT_PARTITION=/dev/nvme0n1p3
+elif ${IS_SSD} != false; then
+  BOOT_PARTITION=/dev/sda1
+  SWAP_PARTITION=/dev/sda2
+  ROOT_PARTITION=/dev/sda3
+else
+  BOOT_PARTITION=/dev/sda1
+  SWAP_PARTITION=/dev/sda2
+  ROOT_PARTITION=/dev/sda3
+fi
+
+
+## This script only supports BTRFS right now; feel free to make a PR for other options in addition to BTRFS if you know bash
+ROOT_FS_TYPE=btrfs
+
+STAGE3="stage3/stage3$*"
+KERNEL_CONFIG_FILE=$(pwd)/kernel-configs/.config-gentoo # kernel config file is optimized for my particular system; you will have to modify it for your system
+
+HOSTNAME="GENTOO"
+
+PACKAGES="sys-fs/btrfs-progs sys-fs/btrfsmaintenance sys-fs/e2fsprogs sys-fs/dosfstools sys-fs/ntfs3g net-wireless/iwd net-wireless/wireless-tools net-misc/dhcpcd app-text/tree sys-apps/pciutils sys-fs/genfstab x11-misc/xdg-user-dirs"
+TOOLS="app-admin/sysklogd sys-process/cronie sys-apps/mlocate sys-apps/man-pages sys-apps/man-db app-editors/nano app-shells/bash"
+
+
+## Video card check
+# Note: A bash case check would look prettier here; might need help with doing this here though
+if [ ${INSTALL_INTEL_DRIVER} != false ]; then
+  USE+=" intel"
+  USED_VIDEO_CARDS="intel"
+elif [ ${INSTALL_NVIDIA_DRIVER} != false ] && [ ${INSTALL_INTEL_DRIVER} != false ]; then
+  USE+=" intel nvidia bbswitch persistenced driver"
+  USED_VIDEO_CARDS="intel nvidia"
+elif [ ${INSTALL_NVIDIA_DRIVER} != false ] && [ ${INSTALL_NVIDIA_OPEN_GPU_MODULES} != true ] ; then
+  USE+=" nvidia persistenced driver"
+  USED_VIDEO_CARDS="nvidia"
+elif [ ${INSTALL_NVIDIA_OPEN_GPU_MODULES} != false ] && [ ${INSTALL_INTEL_DRIVER} != false ]; then
+  USE+=" intel nvidia bbswitch kernel-open persistenced"
+  USED_VIDEO_CARDS="nvidia"
+elif [ ${INSTALL_NVIDIA_OPEN_GPU_MODULES} != false ]; then
+  USE+=" nvidia kernel-open persistenced"
+  USED_VIDEO_CARDS="nvidia"
+elif [ ${INSTALL_NOUVEAU_DRIVER} != false ] && [ ${INSTALL_INTEL_DRIVER} != false ]; then
+  USE+=" intel nouveau bbswitch"
+  USED_VIDEO_CARDS="intel nouveau"
+elif [ ${INSTALL_NOUVEAU_DRIVER} != false ]; then
+  USE+=" nouveau"
+  USED_VIDEO_CARDS="nouveau"
+elif [ ${USE_RADEON} != false ] && [ ${INSTALL_INTEL_DRIVER} != false ]; then
+  USE+=" intel radeon"
+  USED_VIDEO_CARDS="intel radeon"
+elif [ ${USE_RADEON} != false ]; then
+  USE+=" radeon"
+  USED_VIDEO_CARDS="radeon"
+fi
+
+message ()
+{
+  echo
+  echo -e " $LBLUE>>> $LRED $* $NC"
+}
+
+command ()
+{
+  echo -e "$LCYAN$*$NC"
+  "$@"
+  if [ $? -ne 0 ]; then
+    echo -e "$LREDFailed$NC"
+    return 1
+  fi
+}
+
+
+GENTOO_DESKTOP=$(command read -n 1 -r -p "Is the desired installation intended to be a desktop? (y/n)")
+case "${GENTOO_DESKTOP}" in
+  "y")
+  message "Using a desktop configuration"
+  
+  INSTALL_KDE_PLASMA=$(command read -n 1 -r -p "Install KDE Plasma? (y/n): ")
+  if [ "${INSTALL_KDE_PLASMA}" != "n" ]; then
+    USE_FLAGS+=" colord crash-handler display-manager firewall gtk kde legacy-systray networkmanager qt5 sddm semantic-desktop smart telemetry -discover -gnome -kwallet -qt4 -wallpapers"
+  fi
+  
+  if [ "${GET_ARCH}" == x86_64 ]; then
+    
+    INSTALL_WINE=$(read -n 1 -r -p "Install Wine? (https://wiki.gentoo.org/wiki/Wine) - (y/n): ")
+    if [ "${INSTALL_WINE}" != "n" ]; then
+      message "Adding Wine packages to LATE_PACKAGES"
+      LATE_PACKAGES+=" app-emulation/wine-vanilla app-emulation/wine-gecko app-emulation/wine-mono app-emulation/winetricks app-emulation/wine-desktop-common"
+    fi
+    
+    INSTALL_STEAM=$(read -n 1 -r -p "Install Steam? (https://wiki.gentoo.org/wiki/Steam) - (y/n): ")
+    if [ "${INSTALL_STEAM}" != "n" ] && [ "${GET_ARCH}" == x86_64 ]; then
+      message "Enabling Steam for installation later"
+    fi
+    
+  fi
+  
+  INSTALL_GAME_EMULATORS=$(read -n 1 -r -p "Install game emulators?- (y/n): ") ## Use this if you like to play retro games :)
+  if [ "${INSTALL_GAME_EMULATORS}" != "n" ]; then
+    message "Adding game emulators to be installed later."
+  fi
+  
+  INSTALL_FLATPAK=$(read -n 1 -r -p "Install flatpak? (https://wiki.gentoo.org/wiki/Flatpak) - (y/n): ")
+  if [ "${INSTALL_FLATPAK}" != "n" ]; then
+    message "Adding flatpak packages to LATE_PACKAGES"
+    LATE_PACKAGES+=" sys-apps/flatpak"
+  fi
+  ;;
+  "n")
+  message "Using a non-desktop configuration"
+  ;;
+  *)
+  ## I want to use case switches instead of these if-checks but I need proper error handling implementation first to avoid breaking the script in the event a user mistake is made
+  message "A system type must be selected."
+  return 1
+  ;;
+esac
+
+
+message "The value below attempts to build the entire system via the Clang LLVM compiler;"
+message "this would only be applicable much later, but does lengthen installation time."
+MAKE_CLANG_DEFAULT_COMPILER=$(read -n 1 -r -p "Make Clang the default compiler? - (y/n): ")
+if [ "${MAKE_CLANG_DEFAULT_COMPILER}" != "n" ]; then
+  MAKE_CLANG_DEFAULT_COMPILER=true
+  message "Set Clang as the default compiler."
+else
+  MAKE_CLANG_DEFAULT_COMPILER=false
+  message "Set GCC as the default compiler."
+fi
+
+INSTALL_DOAS=$(read -n 1 -r -p "Install doas? (It's a smaller sudo replacement semi-ported from BSD-land) - (y/n): ")
+if [ "${INSTALL_DOAS}" != "n" ]; then
+  message "Adding 'doas' to TOOLS"
+  TOOLS+=" app-admin/doas"
+fi
+
+message "For more information about uutils as of 2022, see: https://youtu.be/ZIgve4YpipE"
+INSTALL_UUTILS=$(read -n 1 -r -p "Install the Rust port of GNU coreutils instead (uutils)? (https://github.com/uutils/coreutils) - (y/n): ")
+if [ "${INSTALL_UUTILS}" != "n" ]; then
+  message "Adding 'sys-apps/uutils' to PACKAGES"
+  PACKAGES+=" sys-apps/uutils"
+fi
+
+EMERGE_UNATTENDED=$(read -n 1 -r -p "Run the install script (mostly) unattended? - (y/n): ")
+if [ "${EMERGE_UNATTENDED}" != "n" ]; then
+  message "Selected unattended"
+  EMERGE="emerge"
+else
+  message "Selected interactive"
+  EMERGE="emerge --ask"
+fi
+
+install_gentoo_prep ()
+{
+  #Disk Setup
+  message "Beginning Installation Process"
+  message "Formating Boot Partition"
+  command mkfs.fat -F 32 ${BOOT_PARTITION}
+  message "Formating Swap Partition"
+  command mkswap -f ${SWAP_PARTITION}
+  command swapon ${SWAP_PARTITION}
+  message "Formating Root Partition"
+  command mkfs.${ROOT_FS_TYPE} -f ${ROOT_PARTITION}
+  
+  message "Adding partition labels"
+  command e2label ${BOOT_PARTITION} "boot"
+  command swaplabel ${SWAP_PARTITION} -L "swap"
+  command btrfs filesystem label ${ROOT_PARTITION} "root-partition"
+
+  #Mount Disks
+  message "Mounting Root and Boot partitions"
+  command mount -v ${ROOT_PARTITION} "${MOUNT_LOCATION}"
+  command mkdir -pv "${MOUNT_LOCATION}/boot"
+  command mount -v ${BOOT_PARTITION} "${MOUNT_LOCATION}/boot"
+
+  message "Make sure that date and time is set correctly, if it isn't then it can cause problems in the future"
+  command date
+  message "Is the following date correct (y/n)?"
+  read -r DATE_CORRECT
+  if [ "${DATE_CORRECT}" = "n" ]; then
+    message "Enter the date and time in MMDDhhmmYYYY format"
+    read -r CORRECTED_DATE
+    command date "${CORRECTED_DATE}"
+  fi
+
+  #Stage3 Tarball
+#   message "Copying stage3 tarball to system"
+#   command cp -rv "${STAGE3}" "${MOUNT_LOCATION}"
+#   command cd "${MOUNT_LOCATION}"
+
+  message "Extracting stage3 tarball"
+  command tar --numeric-owner --xattrs xvjpf "${STAGE3}" -C "${MOUNT_LOCATION}"
+  command rm "${STAGE3}"
+  command cd "${MOUNT_LOCATION}" || return
+
+  message "Copying configuration files"
+  command mkdir -pv "${MOUNT_LOCATION}/etc"
+  command mkdir -pv "${MOUNT_LOCATION}/etc/portage"
+
+  if [ ${USE_KERNEL_CONFIG} != false ]; then
+    message "Copying kernel configuration files"
+    command cp -rv "${KERNEL_CONFIG_FILE}" "${MOUNT_LOCATION}/kernel-config"
+  fi
+
+  ## Chroot
+  message "Copying DNS info"
+  command cp -L /etc/resolv.conf "${MOUNT_LOCATION}"/etc/
+  
+  case "${DISTRO}" in
+    "Arch-based")
+    if test -x "$(command pacman -Qi arch-install-scripts > /dev/null 2>&1)"; then
+      if [ ${IS_SSD} != true ] || [ ${IS_SSD} != true ] && [ ${IS_NVME} != true ]; then
+        message "Generating fstab file"
+        command genfstab -L / >> "${MOUNT_LOCATION}/etc/fstab"
+      fi
+    else
+      echo "Dependency 'arch-install-scripts' was not found."
+      return 1
+    fi
+    ;;
+    
+    "Gentoo-based")
+      if [ ${IS_SSD} != true ] || [ ${IS_SSD} != true ] && [ ${IS_NVME} != true ]; then
+        message "Installing genfstab"
+        command emerge --oneshot --noreplace sys-fs/genfstab
+        message "Generating fstab file"
+        command genfstab -L / >> "${MOUNT_LOCATION}/etc/fstab"
+      fi
+    ;;
+    
+    *)
+    if test -x "$(command genfstab > /dev/null 2>&1)"; then
+      if [ ${IS_SSD} != true ] || [ ${IS_SSD} != true ] && [ ${IS_NVME} != true ]; then
+        message "Generating fstab file"
+        command genfstab -L / >> "${MOUNT_LOCATION}/etc/fstab"
+      fi
+    else
+      echo "Non-supported distro type is being used; returning."
+      return 1
+    fi
+    ;;
+  esac
+  message "Mounting Necessary Filesystems"
+  command mount -t proc proc /mnt/gentoo/proc
+  command mount --rbind /sys /mnt/gentoo/sys
+  command mount --make-rslave /mnt/gentoo/sys
+  command mount --rbind /dev /mnt/gentoo/dev
+  command mount --make-rslave /mnt/gentoo/dev
+
+  message "Chrooting into System"
+  command chroot "${MOUNT_LOCATION}" /bin/env -i TERM="${TERM}" /bin/bash -c "install_gentoo_chroot"
+}
+
+install_gentoo_chroot()
+{
+  message "Inside chroot env"
+  command env-update
+  command source /etc/profile
+  command export PS1="(chroot) $PS1"
+
+  #Portage
+  message "Installing portage snapshot"
+  command emerge-webrsync
+  message "Updating portage tree"
+  command emerge --sync
+
+  message "Configuring /etc/portage/env/compiler-gcc"
+  cat << EOF > /etc/portage/env/compiler-gcc
+CC="gcc"
+CXX="g++"
+AR="ar"
+NM="nm"
+RANLIB="ranlib"
+_HARDENING_FLAGS="-fstack-clash-protection -fstack-protector-strong -fcf-protection -Wp,-D_FORTIFY_SOURCE=2"
+CFLAGS="${CFLAGS} \${_HARDENING_FLAGS}"
+CXXFLAGS="\${CFLAGS}"
+RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+LDFLAGS="-lpthread -Wl,-O3,--sort-common,--as-needed,-z,relro,-z,now"
+CPU_FLAGS="${CPU_FLAGS}"
+
+# WARNING: Changing your CHOST is not something that should be done lightly.
+# Please consult http://www.gentoo.org/doc/en/change-chost.xml before changing.
+CHOST="x86_64-pc-linux-gnu"
+# These are the USE flags that were used in addition to what is provided by the
+# profile used for building.
+USE="${USE_FLAGS}"
+MAKEOPTS="-j${_PARALLEL_THREADS}"
+PORTDIR="/usr/portage"
+DISTDIR="${PORTDIR}/distfiles"
+PKGDIR="${PORTDIR}/packages"
+ACCEPT_LICENSE="*"
+VIDEO_CARDS="${USED_VIDEO_CARDS}"
+EOF
+  chmod 755 /etc/portage/env/compiler-gcc
+  
+  message "Configuring /etc/portage/make.conf"
+  if [ -f /etc/portage/make.conf ]; then
+  cp -v /etc/portage/make.conf /etc/portage/make.conf.default.bak
+  fi
+  cp -v /etc/portage/env/compiler-gcc /etc/portage/make.conf
+  
+  message "Configuring /etc/portage/env/compiler-gcc-static"
+  cat << EOF > /etc/portage/env/compiler-gcc-static
+CC="gcc"
+CXX="g++"
+AR="ar"
+NM="nm"
+RANLIB="ranlib"
+_HARDENING_FLAGS="-fstack-clash-protection -fstack-protector-strong -fcf-protection -Wp,-D_FORTIFY_SOURCE=2"
+CFLAGS="${CFLAGS} \${_HARDENING_FLAGS}"
+CXXFLAGS="\${CFLAGS}"
+RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+LDFLAGS="-lpthread -static -Wl,-O3,--sort-common,--as-needed,-z,relro,-z,now"
+CPU_FLAGS="${CPU_FLAGS}"
+
+# WARNING: Changing your CHOST is not something that should be done lightly.
+# Please consult http://www.gentoo.org/doc/en/change-chost.xml before changing.
+CHOST="x86_64-pc-linux-gnu"
+# These are the USE flags that were used in addition to what is provided by the
+# profile used for building.
+USE="${USE_FLAGS}"
+MAKEOPTS="-j${_PARALLEL_THREADS}"
+PORTDIR="/usr/portage"
+DISTDIR="${PORTDIR}/distfiles"
+PKGDIR="${PORTDIR}/packages"
+ACCEPT_LICENSE="*"
+VIDEO_CARDS="${USED_VIDEO_CARDS}"
+EOF
+  chmod 755 /etc/portage/env/compiler-gcc-static
+
+  message "Configuring /etc/portage/env/compiler-gcc-nvidia"
+  cat << EOF > /etc/portage/env/compiler-gcc-nvidia
+CC="gcc"
+CXX="g++"
+AR="ar"
+NM="nm"
+RANLIB="ranlib"
+_HARDENING_FLAGS="-fstack-clash-protection -fstack-protector-strong -fcf-protection -Wp,-D_FORTIFY_SOURCE=2"
+CFLAGS="${CFLAGS} \${_HARDENING_FLAGS}"
+CXXFLAGS="\${CFLAGS}"
+RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+LDFLAGS="-lpthread -static -Wl,-O3,--sort-common,--as-needed,-z,relro,-z,now"
+CPU_FLAGS="${CPU_FLAGS}"
+
+# WARNING: Changing your CHOST is not something that should be done lightly.
+# Please consult http://www.gentoo.org/doc/en/change-chost.xml before changing.
+CHOST="x86_64-pc-linux-gnu"
+# These are the USE flags that were used in addition to what is provided by the
+# profile used for building.
+USE="${USE_FLAGS} static-libs tools"
+MAKEOPTS="-j${_PARALLEL_THREADS}"
+PORTDIR="/usr/portage"
+DISTDIR="${PORTDIR}/distfiles"
+PKGDIR="${PORTDIR}/packages"
+ACCEPT_LICENSE="*"
+VIDEO_CARDS="nvidia"
+EOF
+  chmod 755 /etc/portage/env/compiler-gcc-nvidia
+
+    message "Configuring /etc/portage/env/compiler-gcc-wine"
+  cat << EOF > /etc/portage/env/compiler-gcc-wine
+### Wine doesn't play nice with LTO; it usually doesn't compile
+CC="gcc"
+CXX="g++"
+AR="ar"
+NM="nm"
+RANLIB="ranlib"
+_CLFAGS="${CFLAGS/-fno-plt/}" ## Wine Doesn't play nice with -fno-plt
+_CLFAGS="\${_CFLAGS/-O3/}" ## Wine is faster with -O2
+CFLAGS="\${_CFLAGS} -O2"
+CXXFLAGS="\${CFLAGS}"
+RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+LDFLAGS="-lpthread -Wl,-O3,--sort-common,--as-needed" ## mingw can't use relro
+CROSSCFLAGS="\${CFLAGS}"
+CROSSCXXFLAGS="\${CXXFLAGS}"
+CROSSLDFLAGS="\${LDFLAGS}"
+CPU_FLAGS="${CPU_FLAGS}"
+
+# WARNING: Changing your CHOST is not something that should be done lightly.
+# Please consult http://www.gentoo.org/doc/en/change-chost.xml before changing.
+CHOST="x86_64-pc-linux-gnu"
+# These are the USE flags that were used in addition to what is provided by the
+# profile used for building.
+USE="${USE_FLAGS} capi cups fontconfig gecko gstreamer mono mp3 netapi nls odbc openal opengl osmesa oss pcap perl realtime run-exes samba scanner sdl ssl threads unwind xcomposite xinerama abi_x86_64 abi_x86_32 -custom-cflags -mingw -crossdev-mingw"
+MAKEOPTS="-j${_PARALLEL_THREADS}"
+PORTDIR="/usr/portage"
+DISTDIR="${PORTDIR}/distfiles"
+PKGDIR="${PORTDIR}/packages"
+ACCEPT_LICENSE="*"
+VIDEO_CARDS="${USED_VIDEO_CARDS}"
+EOF
+  chmod 755 /etc/portage/env/compiler-gcc-wine
+
+  message "Configuring /etc/portage/env/compiler-gcc-lto"
+  cat << EOF > /etc/portage/env/compiler-gcc-lto
+CC="gcc"
+CXX="g++"
+AR="gcc-ar"
+NM="gcc-nm"
+RANLIB="gcc-ranlib"
+_HARDENING_FLAGS="-fstack-clash-protection -fstack-protector-strong -fcf-protection -Wp,-D_FORTIFY_SOURCE=2"
+CFLAGS="${CFLAGS} \${_HARDENING_FLAGS}"
+CXXFLAGS="\${CFLAGS}"
+RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+LDFLAGS="-flto -fuse-linker-plugin -lpthread -Wl,-O3,--sort-common,--as-needed,-z,relro,-z,now"
+CPU_FLAGS="${CPU_FLAGS}"
+
+# WARNING: Changing your CHOST is not something that should be done lightly.
+# Please consult http://www.gentoo.org/doc/en/change-chost.xml before changing.
+CHOST="x86_64-pc-linux-gnu"
+# These are the USE flags that were used in addition to what is provided by the
+# profile used for building.
+USE="${USE_FLAGS}"
+MAKEOPTS="-j${_PARALLEL_THREADS}"
+PORTDIR="/usr/portage"
+DISTDIR="${PORTDIR}/distfiles"
+PKGDIR="${PORTDIR}/packages"
+ACCEPT_LICENSE="*"
+VIDEO_CARDS="${USED_VIDEO_CARDS}"
+EOF
+  chmod 755 /etc/portage/env/compiler-gcc-lto
+  
+  message "Configuring /etc/portage/env/compiler-gcc-static-lto"
+  cat << EOF > /etc/portage/env/compiler-gcc-static-lto
+CC="gcc"
+CXX="g++"
+AR="gcc-ar"
+NM="gcc-nm"
+RANLIB="gcc-ranlib"
+_HARDENING_FLAGS="-fstack-clash-protection -fstack-protector-strong -fcf-protection -Wp,-D_FORTIFY_SOURCE=2"
+CFLAGS="${CFLAGS} \${_HARDENING_FLAGS}"
+CXXFLAGS="\${CFLAGS}"
+RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+LDFLAGS="-flto -fuse-linker-plugin -lpthread -static -Wl,-O3,--sort-common,--as-needed,-z,relro,-z,now"
+CPU_FLAGS="${CPU_FLAGS}"
+
+# WARNING: Changing your CHOST is not something that should be done lightly.
+# Please consult http://www.gentoo.org/doc/en/change-chost.xml before changing.
+CHOST="x86_64-pc-linux-gnu"
+# These are the USE flags that were used in addition to what is provided by the
+# profile used for building.
+USE="${USE_FLAGS}"
+MAKEOPTS="-j${_PARALLEL_THREADS}"
+PORTDIR="/usr/portage"
+DISTDIR="${PORTDIR}/distfiles"
+PKGDIR="${PORTDIR}/packages"
+ACCEPT_LICENSE="*"
+VIDEO_CARDS="${USED_VIDEO_CARDS}"
+EOF
+  chmod 755 /etc/portage/env/compiler-gcc-static-lto
+
+  message "Configuring /etc/portage/env/compiler-clang"
+  cat << EOF > /etc/portage/env/compiler-clang
+### See:
+## https://wiki.gentoo.org/wiki/Clang
+## https://bugs.gentoo.org/408963
+## and
+## https://github.com/BilyakA/gentoo-clang 
+### for building an exclusively clang system
+
+CC="clang"
+CXX="clang++"
+OBJC=clang
+LD="/usr/bin/ld.lld"
+AS="llvm-as"
+### Ignore these three for non-LTO builds:
+AR=""
+NM=""
+RANLIB=""
+###
+STRIP="llvm-strip"
+OBJCOPY="llvm-objcopy"
+_HARDENING_FLAGS="-fstack-clash-protection -fstack-protector-strong -fcf-protection -Wp,-D_FORTIFY_SOURCE=2"
+CFLAGS="${CFLAGS} \${_HARDENING_FLAGS}"
+CXXFLAGS="\${CFLAGS}"
+RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+LDFLAGS="-lpthread -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind -Wl,-O3,--sort-common,--as-needed,-z,relro,-z,now"
+CPU_FLAGS="${CPU_FLAGS}"
+
+# WARNING: Changing your CHOST is not something that should be done lightly.
+# Please consult http://www.gentoo.org/doc/en/change-chost.xml before changing.
+CHOST="x86_64-pc-linux-gnu"
+# These are the USE flags that were used in addition to what is provided by the
+# profile used for building.
+USE="${USE_FLAGS} libcxxabi libunwind"
+MAKEOPTS="-j${_PARALLEL_THREADS}"
+PORTDIR="/usr/portage"
+DISTDIR="${PORTDIR}/distfiles"
+PKGDIR="${PORTDIR}/packages"
+ACCEPT_LICENSE="*"
+VIDEO_CARDS="${USED_VIDEO_CARDS}"
+EOF
+  chmod 755 /etc/portage/env/compiler-clang
+  
+  message "Configuring /etc/portage/env/compiler-clang-static"
+  cat << EOF > /etc/portage/env/compiler-clang-static
+### See:
+## https://wiki.gentoo.org/wiki/Clang
+## https://bugs.gentoo.org/408963
+## and
+## https://github.com/BilyakA/gentoo-clang 
+### for building an exclusively clang system
+
+CC="clang"
+CXX="clang++"
+OBJC=clang
+LD="/usr/bin/ld.lld"
+AS="llvm-as"
+### Ignore these three for non-LTO builds:
+AR=""
+NM=""
+RANLIB=""
+###
+STRIP="llvm-strip"
+OBJCOPY="llvm-objcopy"
+_HARDENING_FLAGS="-fstack-clash-protection -fstack-protector-strong -fcf-protection -Wp,-D_FORTIFY_SOURCE=2"
+CFLAGS="${CFLAGS} \${_HARDENING_FLAGS}"
+CXXFLAGS="\${CFLAGS}"
+RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+LDFLAGS="-lpthread -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind -static -Wl,-O3,--sort-common,--as-needed,-z,relro,-z,now"
+CPU_FLAGS="${CPU_FLAGS}"
+
+# WARNING: Changing your CHOST is not something that should be done lightly.
+# Please consult http://www.gentoo.org/doc/en/change-chost.xml before changing.
+CHOST="x86_64-pc-linux-gnu"
+# These are the USE flags that were used in addition to what is provided by the
+# profile used for building.
+USE="${USE_FLAGS} libcxxabi libunwind"
+MAKEOPTS="-j${_PARALLEL_THREADS}"
+PORTDIR="/usr/portage"
+DISTDIR="${PORTDIR}/distfiles"
+PKGDIR="${PORTDIR}/packages"
+ACCEPT_LICENSE="*"
+VIDEO_CARDS="${USED_VIDEO_CARDS}"
+EOF
+  chmod 755 /etc/portage/env/compiler-clang-static
+
+  message "Configuring /etc/portage/env/compiler-clang-nvidia"
+  cat << EOF > /etc/portage/env/compiler-clang-nvidia
+### See:
+## https://wiki.gentoo.org/wiki/Clang
+## https://bugs.gentoo.org/408963
+## and
+## https://github.com/BilyakA/gentoo-clang 
+### for building an exclusively clang system
+
+CC="clang"
+CXX="clang++"
+OBJC=clang
+LD="/usr/bin/ld.lld"
+AS="llvm-as"
+### Ignore these three for non-LTO builds:
+AR=""
+NM=""
+RANLIB=""
+###
+STRIP="llvm-strip"
+OBJCOPY="llvm-objcopy"
+_HARDENING_FLAGS="-fstack-clash-protection -fstack-protector-strong -fcf-protection -Wp,-D_FORTIFY_SOURCE=2"
+CFLAGS="${CFLAGS} \${_HARDENING_FLAGS}"
+CXXFLAGS="\${CFLAGS}"
+RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+LDFLAGS="-lpthread -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind -static -Wl,-O3,--sort-common,--as-needed,-z,relro,-z,now"
+CPU_FLAGS="${CPU_FLAGS}"
+
+# WARNING: Changing your CHOST is not something that should be done lightly.
+# Please consult http://www.gentoo.org/doc/en/change-chost.xml before changing.
+CHOST="x86_64-pc-linux-gnu"
+# These are the USE flags that were used in addition to what is provided by the
+# profile used for building.
+USE="${USE_FLAGS} static-libs tools libcxxabi libunwind"
+MAKEOPTS="-j${_PARALLEL_THREADS}"
+PORTDIR="/usr/portage"
+DISTDIR="${PORTDIR}/distfiles"
+PKGDIR="${PORTDIR}/packages"
+ACCEPT_LICENSE="*"
+VIDEO_CARDS="nvidia"
+EOF
+  chmod 755 /etc/portage/env/compiler-clang-nvidia
+  
+  message "Configuring /etc/portage/env/compiler-clang-wine"
+  cat << EOF > /etc/portage/env/compiler-clang-wine
+## Not the Wine default because Wine doesn't always play nice with Clang at runtime
+
+### See:
+## https://wiki.gentoo.org/wiki/Clang
+## https://bugs.gentoo.org/408963
+## and
+## https://github.com/BilyakA/gentoo-clang 
+### for building an exclusively clang system
+
+CC="clang"
+CXX="clang++"
+OBJC=clang
+LD="/usr/bin/ld.lld"
+AS="llvm-as"
+### Ignore these three for non-LTO builds:
+AR=""
+NM=""
+RANLIB=""
+### Wine doesn't play nice with LTO; it usually doesn't compile
+STRIP="llvm-strip"
+OBJCOPY="llvm-objcopy"
+_CLFAGS="${CFLAGS/-fno-plt/}" ## Wine Doesn't play nice with -fno-plt
+_CLFAGS="\${_CFLAGS/-O3/}" ## Wine is faster with -O2
+CFLAGS="\${_CFLAGS} -O2 -std=gnu89"
+CXXFLAGS="\${CFLAGS}"
+RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+LDFLAGS="-lpthread -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind -static -Wl,-O2,--sort-common,--as-needed" ## mingw can't use relro
+CROSSCFLAGS="\${CFLAGS}"
+CROSSCXXFLAGS="\${CXXFLAGS}"
+CROSSLDFLAGS="\${LDFLAGS}"
+CPU_FLAGS="${CPU_FLAGS}"
+
+# WARNING: Changing your CHOST is not something that should be done lightly.
+# Please consult http://www.gentoo.org/doc/en/change-chost.xml before changing.
+CHOST="x86_64-pc-linux-gnu"
+# These are the USE flags that were used in addition to what is provided by the
+# profile used for building.
+USE="${USE_FLAGS} capi cups fontconfig gecko gstreamer mono mp3 netapi nls odbc openal opengl osmesa oss pcap perl realtime run-exes samba scanner sdl ssl threads unwind xcomposite xinerama abi_x86_64 abi_x86_32 -custom-cflags -mingw -crossdev-mingw libcxxabi libunwind"
+MAKEOPTS="-j${_PARALLEL_THREADS}"
+PORTDIR="/usr/portage"
+DISTDIR="${PORTDIR}/distfiles"
+PKGDIR="${PORTDIR}/packages"
+ACCEPT_LICENSE="*"
+VIDEO_CARDS="${USED_VIDEO_CARDS}"
+EOF
+  chmod 755 /etc/portage/env/compiler-clang-wine
+
+  message "Configuring /etc/portage/env/compiler-clang-lto"
+  cat << EOF > /etc/portage/env/compiler-clang-lto
+### See:
+## https://wiki.gentoo.org/wiki/Clang
+## https://bugs.gentoo.org/408963
+## and
+## https://github.com/BilyakA/gentoo-clang 
+### for building an exclusively clang system
+
+CC="clang"
+CXX="clang++"
+OBJC=clang
+LD="/usr/bin/ld.lld"
+AR="llvm-ar"
+NM="llvm-nm"
+AS="llvm-as"
+RANLIB="llvm-ranlib"
+STRIP="llvm-strip"
+OBJCOPY="llvm-objcopy"
+_HARDENING_FLAGS="-fstack-clash-protection -fstack-protector-strong -fcf-protection -Wp,-D_FORTIFY_SOURCE=2"
+CFLAGS="${CFLAGS} -flto=thin \${_HARDENING_FLAGS}"
+CXXFLAGS="\${CFLAGS}"
+RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+LDFLAGS="-lpthread -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind -Wl,-O3,--sort-common,--as-needed,-z,relro,-z,now"
+CPU_FLAGS="${CPU_FLAGS}"
+
+# WARNING: Changing your CHOST is not something that should be done lightly.
+# Please consult http://www.gentoo.org/doc/en/change-chost.xml before changing.
+CHOST="x86_64-pc-linux-gnu"
+# These are the USE flags that were used in addition to what is provided by the
+# profile used for building.
+USE="${USE_FLAGS} libcxxabi libunwind"
+MAKEOPTS="-j${_PARALLEL_THREADS}"
+PORTDIR="/usr/portage"
+DISTDIR="${PORTDIR}/distfiles"
+PKGDIR="${PORTDIR}/packages"
+ACCEPT_LICENSE="*"
+VIDEO_CARDS="${USED_VIDEO_CARDS}"
+EOF
+  chmod 755 /etc/portage/env/compiler-clang-lto
+  
+    message "Configuring /etc/portage/env/compiler-clang-static-lto"
+  cat << EOF > /etc/portage/env/compiler-clang-static-lto
+### See:
+## https://wiki.gentoo.org/wiki/Clang
+## https://bugs.gentoo.org/408963
+## and
+## https://github.com/BilyakA/gentoo-clang 
+### for building an exclusively clang system
+## This file exists to prevent system-critical packages from breaking due to dependency issues
+
+CC="clang"
+CXX="clang++"
+OBJC=clang
+LD="/usr/bin/ld.lld"
+AR="llvm-ar"
+NM="llvm-nm"
+AS="llvm-as"
+RANLIB="llvm-ranlib"
+STRIP="llvm-strip"
+OBJCOPY="llvm-objcopy"
+_HARDENING_FLAGS="-fstack-clash-protection -fstack-protector-strong -fcf-protection -Wp,-D_FORTIFY_SOURCE=2"
+CFLAGS="${CFLAGS} -flto=thin \${_HARDENING_FLAGS}"
+CXXFLAGS="\${CFLAGS}"
+RUSTFLAGS="-C opt-level=3 -C target-cpu=native"
+LDFLAGS="-lpthread -fuse-ld=lld -rtlib=compiler-rt -unwindlib=libunwind -static -Wl,-O3,--sort-common,--as-needed,-z,relro,-z,now"
+CPU_FLAGS="${CPU_FLAGS}"
+
+# WARNING: Changing your CHOST is not something that should be done lightly.
+# Please consult http://www.gentoo.org/doc/en/change-chost.xml before changing.
+CHOST="x86_64-pc-linux-gnu"
+# These are the USE flags that were used in addition to what is provided by the
+# profile used for building.
+USE="${USE_FLAGS} libcxxabi libunwind"
+MAKEOPTS="-j${_PARALLEL_THREADS}"
+PORTDIR="/usr/portage"
+DISTDIR="${PORTDIR}/distfiles"
+PKGDIR="${PORTDIR}/packages"
+ACCEPT_LICENSE="*"
+VIDEO_CARDS="${USED_VIDEO_CARDS}"
+EOF
+  chmod 755 /etc/portage/env/compiler-clang-static-lto
+
+  #Installation
+  #   message "Setting Profile to default/linux/amd64/13.0/desktop"
+  #   command eselect profile set default/linux/amd64/13.0/desktop
+
+  ## Recursive error handling would be desired here but is difficult for me to properly figure out at the moment
+  ## Not sure which of these two is the better method of implementing interactive eselect
+  
+  #  command read -r -p "Enter the desired profile value via 'eselect profile set ': "
+  #  command read -n 1 -r -p "Enter the desired profile value: " | eselect profile set
+  case ${GENTOO_DESKTOP} in
+  "y")
+  
+  if [ "${INSTALL_KDE_PLASMA}" != "n" ]; then
+    plasma_profile_selection () {
+      message "Select a KDE Plasma Desktop profile:"
+      message "NOTE: DO NOT select 'no-multilib' if installing Wine or Steam (Steam is enabled by default in this script)"
+      message "NOTE: DO NOT select 'systemd' without modifying this script to support it"
+      command eselect profile list | grep plasma
+      PROFILE_SELECTION=$(command read -n 1 -r -p "Enter the desired profile value: ")
+      if [ "${PROFILE_SELECTION}" -lt 1 ] || [ "${PROFILE_SELECTION}" -gt 9 ]; then
+        plasma_profile_selection
+      fi
+    }
+    plasma_profile_selection
+  fi
+  
+  ;;
+  
+  "n")
+  ;;
+  esac
+
+  message "Updating @world set"
+  command ${EMERGE} --update --deep --newuse @world
+
+  message "Installing filesystem packages"
+  command ${EMERGE} "${PACKAGES}"
+
+  message "Configuring timezone"
+  command echo "$TIMEZONE" > /etc/timezone
+  command emerge --quiet --config sys-libs/timezone-data
+
+  message "Writing /etc/locale.gen file"
+  cat << EOF > /etc/locale.gen
+# All blank lines and lines starting with # are ignored.
+#en_US ISO-8859-1
+ en_US.UTF-8 UTF-8
+#ja_JP.EUC-JP EUC-JP
+ja_JP.UTF-8 UTF-8
+#ja_JP EUC-JP
+#en_HK ISO-8859-1
+#en_PH ISO-8859-1
+#de_DE ISO-8859-1
+#de_DE@euro ISO-8859-15
+#es_MX ISO-8859-1
+#fa_IR UTF-8
+#fr_FR ISO-8859-1
+#fr_FR@euro ISO-8859-15
+#it_IT ISO-8859-1
+EOF
+
+  command locale-gen
+  command eselect locale set en_US.utf8
+  
+  message "Selecting keymap"
+  command sed -i "/keymap=/c\\keymap=\"us\"" /etc/conf.d/keymaps
+
+  message "Reloading Environment"
+  command env-update && source /etc/profile && export PS1="(chroot) $PS1"
+
+  if [ ${USE_KERNEL_CONFIG} != false ]; then
+    message "Downloading Kernel Sources and mcelog"
+    command ${EMERGE} sys-kernel/gentoo-sources app-admin/mcelog
+  else
+    message "Downloading Gentoo Kernel Source and mcelog"
+    command ${EMERGE} sys-kernel/installkernel-gentoo
+    command ${EMERGE} sys-kernel/gentoo-kernel-bin app-admin/mcelog
+  fi  
+
+  message "Cleaning Kernel source folder"
+  command cd /usr/src/linux/ || return
+  command make clean
+  command make mrproper
+  
+  if [ ${USE_KERNEL_CONFIG} != false ]; then
+    message "Loading kernel configuration file"
+    command mv -v /kernel-config /usr/src/linux/.config-gentoo-final
+    command cp -rv /usr/src/linux/.config-gentoo-final /usr/src/linux/.config
+  fi
+
+  message "Beginning Kernel Compilation Process"
+  command make ${MAKE_OPTIONS}
+  command make modules_install
+  command make install
+
+  message "Removing old kernel files"
+  command rm -rf /boot/*old
+  
+  message "Creating bootx64.efi, (Meant for UEFI systems)"
+  command mkdir -pv /boot/efi/boot
+  command cp /boot/vmlinuz-* /boot/efi/boot/bootx64.efi
+
+  message "Installing genkernel"
+  command ${EMERGE} sys-kernel/genkernel
+  
+  message "Installing linux-firmware"
+  command ${EMERGE} sys-kernel/linux-firmware
+  
+  ## Would be good to have CPU detection for this when applicable; AMD microcode is bundled with sys-kernel/linux-firmware
+  if [ ${INSTALL_INTEL_DRIVER} != false ]; then
+    message "Installing Intel microcode"
+    command ${EMERGE} sys-kernel/intel-microcode
+  fi
+  
+  message "Generating initramfs"
+  if [ ${USE_KERNEL_CONFIG} != false ]; then
+    command genkernel --${ROOT_FS_TYPE} --kerneldir=/usr/src/linux --kernel-config="/usr/src/linux/.config-gentoo-final" --install --no-ramdisk-modules initramfs
+  else
+    command genkernel --${ROOT_FS_TYPE} --kerneldir=/usr/src/linux --install --no-ramdisk-modules initramfs
+  fi
+
+  if [ ${IS_SSD} != false ] || [ ${IS_SSD} != false ] && [ ${IS_NVME} != false ]; then
+    cat << EOF > /etc/fstab
+# /etc/fstab: static file system information.
+#
+# noatime turns off atimes for increased performance (atimes normally aren't
+# needed); notail increases performance of ReiserFS (at the expense of storage
+# efficiency).  It's safe to drop the noatime options if you want and to
+# switch between notail / tail freely.
+#
+# The root filesystem should have a pass number of either 0 or 1.
+# All other filesystems should have a pass number of 0 or greater than 1.
+#
+# See the manpage fstab(5) for more information.
+#
+# If these values are undesirable defaults, use sys-fs/genfstab - ex: "genfstab -L (mountpoint) >> /etc/fstab"
+#
+
+# <fs>                  <mountpoint>    <type>          <opts>          <dump/pass>
+
+# NOTE: If your BOOT partition is ReiserFS, add the notail option to opts.
+LABEL=boot               /boot           vfat            rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=ascii,shortname=mixed,utf8,errors=remount-ro        0 2
+LABEL=swap               none            swap            defaults        0 0
+LABEL=root-partition     /               btrfs           rw,relatime,compress=zstd:3,ssd,space_cache=v2,subvolid=5,subvol=/        0 0
+EOF
+  fi
+
+  message "Making a backup of the fstab configuration"
+  command cp -v /etc/fstab /etc/fstab.bak
+
+  message "Setting Hostname"
+  command sed -i "s/localhost/${HOSTNAME}/g" /etc/conf.d/hostname
+  command ln -s /etc/conf.d/hostname /etc/hostname
+  command cat << EOF > /etc/hosts
+127.0.0.1        localhost
+::1              localhost
+127.0.1.1        ${HOSTNAME}
+EOF
+  message "Creating /etc/conf.d/net"
+  command touch /etc/conf.d/net
+  message "Setting traditional network interface names"
+  command ln -s /dev/null /etc/udev/rules.d/80-net-setup-link.rules
+  message "Installing netifrc"
+  command ${EMERGE} --noreplace net-misc/netifrc
+  message "Setting network interfaces to activate at boot"
+  command cd /etc/init.d || return
+  command ln -s net.lo net.eth0
+  # command ln -s net.lo net.wlo0 # Not sure how to set up wireless properly yet
+  command rc-update add net.eth0 default
+  # command rc-update add net.wlo0 default # Not sure how to set up wireless properly yet
+
+  message "Installing tools, cronie, and mlocate for file indexing"
+  command ${EMERGE} "${TOOLS}"
+
+  message "Configuring Bootloader"
+  echo GRUB_PLATFORMS="efi-64" >> /etc/portage/make.conf #For UEFI users only
+  command ${EMERGE} sys-boot/grub:2
+  message "Installing grub2"
+  command grub2-install --target=x86_64-efi --efi-directory=/boot
+  command grub2-mkconfig -o /boot/grub/grub.cfg
+  
+  ## Not sure about installing an initramfs manager?
+  ## https://wiki.gentoo.org/wiki/Initramfs
+
+  message "Base installation has finished but there are still some steps that have to be done!"
+  
+  message "Installing mesa"
+  command ${EMERGE} media-libs/mesa
+  
+  ## Might not be necessary because of: https://wiki.gentoo.org/wiki//etc/portage/make.conf#VIDEO_CARDS (?)
+  ## Not sure if installing them manually like this is necessary given the likes of tasks like Steam, where you obviously can't compile drivers into pre-built binaries...?
+  ## Might just be my non-Gentoo thinking getting in the way
+  if [ ${INSTALL_NVIDIA_DRIVER} != false ] && [ ${INSTALL_INTEL_DRIVER} != false ] || [ ${INSTALL_NVIDIA_OPEN_GPU_MODULES} != false ] && [ ${INSTALL_INTEL_DRIVER} != false ]; then
+    ## Needs to be updated to compile Optimus instead of Bumblebee but it's not available in the official repo(s)
+    message "Installing Nvidia driver with hybrid GPU support"
+    command ${EMERGE} x11-drivers/nvidia-drivers x11-misc/bumblebee
+  elif [ ${INSTALL_NOUVEAU_DRIVER} != false ] && [ ${INSTALL_INTEL_DRIVER} != false ]; then
+    ## Needs to be updated to compile Optimus instead of Bumblebee but it's not available in the official repo(s)
+    message "Installing Nouveau driver with hybrid GPU support"
+    command ${EMERGE} x11-drivers/xf86-video-nouveau x11-misc/bumblebee
+  elif [ ${INSTALL_NVIDIA_DRIVER} != false ] || [ ${INSTALL_NVIDIA_OPEN_GPU_MODULES} != false ]; then
+    message "Installing Nvidia driver"
+    command ${EMERGE} x11-drivers/nvidia-drivers
+  elif [ ${INSTALL_NOUVEAU_DRIVER} != false ]; then
+    message "Installing Nouveau driver"
+    command ${EMERGE} x11-drivers/xf86-video-nouveau
+  fi
+  
+  message "Installing Clang compiler and LLVM; this will take **a while**, go do something"
+  command emerge sys-devel/clang ## Built with GCC compiled llvm (thus not self-hosted)
+  command emerge sys-devel/llvm ## Built with GCC compiled llvm (thus not self-hosted)
+  command emerge sys-libs/libcxx ## ## Built with GCC compiled llvm (thus not self-hosted)
+  message "Configuring /etc/portage/package.env"
+  cat << EOF > /etc/portage/package.env
+sys-devel/clang compiler-clang-static-lto
+sys-devel/llvm compiler-clang-static-lto
+sys-devel/lld compiler-clang-static-lto
+sys-libs/libcxxabi compiler-clang-static-lto
+sys-libs/libcxx compiler-clang-static-lto
+sys-devel/gcc compiler-gcc-static-lto
+app-emulation/wine-vanilla compiler-gcc-wine
+app-emulation/wine-staging compiler-gcc-wine
+app-emulation/wine-gecko compiler-gcc-wine
+app-emulation/wine-mono compiler-gcc-wine
+games-emulation/mgba compiler-clang
+EOF
+ chmod 755 /etc/portage/package.env
+
+  message "Rebuilding Clang compiler LLVM using themselves; this will take **a while**, go do something"
+  emerge --update --deep --changed-use sys-libs/libcxx
+  ## Not sure if doing this separately is okay or not; I expect portage to see that it should also update due to the above depending on it
+  # emerge --update --deep --changed-use sys-libs/libcxxabi
+  emerge --update --deep --changed-use sys-devel/clang
+  emerge --update --deep --changed-use sys-devel/llvm
+
+  message "Backing up /etc/portage/make.conf to /etc/portage/make.conf.bak"
+  command cp -v /etc/portage/make.conf /etc/portage/make.conf.bak
+  
+  if [ ${MAKE_CLANG_DEFAULT_COMPILER} != false ]; then
+    message "Adding a Clang-configured /etc/portage/make.conf"
+  else
+    message "Temporarily adding a Clang-configured /etc/portage/make.conf"
+  fi
+  command cp -v /etc/portage/env/compiler-clang /etc/portage/make.conf
+  
+  message "Installing eselect-repository"
+  command ${EMERGE} app-eselect/eselect-repository
+  
+  message "Configuring /etc/eselect/repository.conf"
+  command mkdir -pv /etc/portage/repos.conf
+  cat << EOF > /etc/eselect/repository.conf
+# configuration for eselect-repo
+# (sourced by bash, so keep the values bash-compatible)
+ 
+# The following variables can be used below to reference paths
+# configured at build time:
+#   CACHEDIR -- system cache directory (e.g. /var/cache)
+#   SYSCONFDIR -- system configuration directory (e.g. /etc)
+#   SHAREDSTATEDIR -- system shared state directory (e.g. /var)
+ 
+# Location of the repository configuration file or directory. If it is
+# a directory, Portage rules for subfiles are used.
+REPOS_CONF=\${SYSCONFDIR}/portage/repos.conf
+
+# File to use for newly added repositories when REPOS_CONF is
+# a directory.  You can use "\${repository}" to refer to the name
+# of repository being added.
+REPOS_CONF_SUBFILE=\${REPOS_CONF}/eselect-repo.conf
+ 
+# Top directory to keep newly added repositores in. New repositories
+# will be added with subdirectories following repository names.
+REPOS_BASE=\${SHAREDSTATEDIR}/db/repos
+ 
+# Location of the remote repository list. The default is to use
+# the gentoo-mirror list that contains pregenerated metadata cache.
+REMOTE_LIST_URI=https://qa-reports.gentoo.org/output/repos/repositories.xml
+ 
+# Alternative: original Gentoo list.
+#REMOTE_LIST_URI=https://api.gentoo.org/overlays/repositories.xml
+ 
+# Directory to store repositories.xml cache. The file will always
+# be called "repositories.xml" due to technical limitations of wget.
+REMOTE_LIST_CACHEDIR=~/.cache/eselect-repo
+ 
+# Interval (in seconds) to check the remote repository list for changes.
+# The default is 2 hours.
+REMOTE_LIST_REFRESH=\$(( 2 * 3600 ))
+EOF
+  
+  case ${GENTOO_DESKTOP} in
+  "y")
+  
+  ## This script only supports installing KDE Plasma right now; if you want, consider creating your own block for your preferred desktop and critical utilities
+  ## and make a pull request for others to enjoy!
+  
+  if [ "${INSTALL_KDE_PLASMA}" != "n" ]; then
+    meessage "Installing KDE Plasma"
+    command ${EMERGE} kde-plasma/plasma-meta
+  
+    meessage "Installing some critical desktop utilities"
+    command ${EMERGE} kde-apps/yakuake kde-apps/konsole kde-apps/dolphin kde-apps/ark kde-apps/kate kde-apps/filelight sys-block/partitionmanager media-sound/pavucontrol-qt media-sound/elisa app-admin/keepassxc
+  
+    message "Enabling SDDM" # Might work? I don't know, never used OpenRC before
+    command rc-update add sddm default
+    
+    message "Configuring PolicyKit rules"
+    cat << EOF > /etc/polkit-1/rules.d/10-admin.rules
+polkit.addAdminRule(function(action, subject) {
+    return ["unix-group:wheel"];
+});
+EOF
+  fi
+  
+  ### Add your desired desktop here:
+  
+  
+  
+  ###
+  
+  INSTALL_KUROO=$(read -n 1 -r -p "Install Kuroo (emerge/portage GUI)? - This is optional - (y/n): ")
+  if [ "${INSTALL_KUROO}" != "n" ]; then
+    command ${EMERGE} app-portage/kuroo
+  fi
+  ;;
+  "n")
+  ;;
+  esac
+  
+  ## https://bugs.gentoo.org/830486 - Someone should look into this, seriously; Arch Linux uses it by default, and coming from Arch, some may be inclined to use it
+  message "Installing shadow password manager"
+  command ${EMERGE} sys-apps/shadow
+  
+  if [ ${MAKE_CLANG_DEFAULT_COMPILER} != false ]; then
+    message "Restoring old /etc/portage/make.conf from /etc/portage/make.conf.bak"
+    command cp -v /etc/portage/make.conf.bak /etc/portage/make.conf
+  else
+    message ""
+    message "From: https://github.com/BilyakA/gentoo-clang"
+    message '"Before you start rebuilding entire world,'
+    message 'remember to include overrided eclasses to your gentoo repository.'
+    message 'Add following to /etc/portage/repos.conf/gentoo.conf in [DEFAULT] section:"'
+    message '-------------------------------'
+    message 'eclass-overrides = gentoo-clang'
+    message '-------------------------------'
+    message "WARNING: THIS PROCESS WILL RECOMPILE EVERYTHING"
+    message ""
+    WORLD_CLANG_TERMS=$(command read -n 1 -r -p "Do you acknowledge these directions? You won't see them again, so write them down if necessary. (y/n): ")
+    if [ "${WORLD_CLANG_TERMS}" != "y" ]; then
+      message "'y' not chosen."
+      message "Restoring old /etc/portage/make.conf from /etc/portage/make.conf.bak"
+      command cp -v /etc/portage/make.conf.bak /etc/portage/make.conf
+      message "Configuring /etc/portage/package.env"
+      if [ ${INSTALL_NVIDIA_DRIVER} != false ] || [ ${INSTALL_NVIDIA_OPEN_GPU_MODULES} != false ]; then
+        cat << EOF > /etc/portage/package.env
+x11-drivers/nvidia-drivers compiler-gcc-nvidia
+EOF
+      fi
+      cat << EOF > /etc/portage/package.env
+sys-fs/btrfs-progs compiler-gcc-static-lto
+sys-fs/btrfsmaintenance compiler-gcc-static-lto
+sys-fs/e2fsprogs compiler-gcc-static-lto
+sys-fs/dosfstools compiler-gcc-static-lto
+sys-fs/ntfs3g compiler-gcc-static-lto
+net-wireless/iwd compiler-gcc-static-lto
+net-wireless/wireless-tools compiler-gcc-static-lto
+net-misc/dhcpcd compiler-gcc-static-lto
+app-text/tree compiler-gcc-static-lto
+sys-apps/pciutils compiler-gcc-static-lto
+dev-vcs/git compiler-gcc-static-lto
+sys-apps/portage compiler-gcc-static-lto
+app-admin/eselect compiler-gcc-static-lto
+sys-kernel/linux-firmware compiler-gcc-static-lto
+sys-kernel/intel-microcode compiler-gcc-static-lto
+sys-apps/openrc compiler-gcc-static-lto
+sys-libs/pam compiler-gcc-static-lto
+app-admin/mcelog compiler-gcc-static-lto
+app-editors/nano compiler-gcc-static-lto
+dev-libs/glib compiler-gcc-static-lto
+sys-libs/glibc compiler-gcc-static-lto
+sys-libs/musl compiler-gcc-static-lto
+media-libs/vulkan-loader compiler-gcc-static-lto
+sys-apps/flatpak compiler-gcc-static-lto
+EOF
+    else
+      message "Enabling the gentoo-clang overlay"
+      command eselect repository enable gentoo-clang
+      message "Entering '/etc/portage/repos.conf/gentoo.conf' for configuration"
+      command nano /etc/portage/repos.conf/gentoo.conf
+      message "Syncing the gentoo-clang overlay"
+      command command emaint sync -r gentoo-clang
+      message "Configuring /etc/portage/package.env"
+      if [ ${INSTALL_NVIDIA_DRIVER} != false ] || [ ${INSTALL_NVIDIA_OPEN_GPU_MODULES} != false ]; then
+        cat << EOF > /etc/portage/package.env
+x11-drivers/nvidia-drivers compiler-clang-nvidia
+EOF
+      fi
+      cat << EOF > /etc/portage/package.env
+sys-fs/btrfs-progs compiler-clang-static-lto
+sys-fs/btrfsmaintenance compiler-clang-static-lto
+sys-fs/e2fsprogs compiler-clang-static-lto
+sys-fs/dosfstools compiler-clang-static-lto
+sys-fs/ntfs3g compiler-clang-static-lto
+net-wireless/iwd compiler-clang-static-lto
+net-wireless/wireless-tools compiler-clang-static-lto
+net-misc/dhcpcd compiler-clang-static-lto
+app-text/tree compiler-clang-static-lto
+sys-apps/pciutils compiler-clang-static-lto
+dev-vcs/git compiler-clang-static-lto
+sys-apps/portage compiler-clang-static-lto
+app-admin/eselect compiler-clang-static-lto
+sys-kernel/linux-firmware compiler-clang-static-lto
+sys-kernel/intel-microcode compiler-clang-static-lto
+sys-apps/openrc compiler-clang-static-lto
+sys-libs/pam compiler-clang-static-lto
+app-admin/mcelog compiler-clang-static-lto
+app-editors/nano compiler-clang-static-lto
+dev-libs/glib compiler-clang-static-lto
+sys-libs/glibc compiler-clang-static-lto
+sys-libs/musl compiler-clang-static-lto
+media-libs/vulkan-loader compiler-clang-static-lto
+sys-apps/flatpak compiler-clang-static-lto
+EOF
+      message "Rebuilding... this will take **a while**, go do something"
+      command emerge -eav1 --with-bdeps=y @world
+    fi
+  fi
+  
+  if [ "${LATE_PACKAGES}" != "" ]; then
+    message "Installing post-install packages..."
+    command ${EMERGE} "${LATE_PACKAGES}"
+  fi
+  
+  ## Not sure if this works as intended?
+  message "Enter your desired root password:"
+  command passwd root
+  
+  CREATE_USER=$(read -n 1 -r -p "Create a user account? - (y/n): ")
+  if [ "${CREATE_USER}" != "n" ]; then
+    message "Adding default user"
+    USER=$(command read -r -p "Enter your username: ")
+    command useradd -m "${USER}"
+    message "Enter your desired user password:"
+    command passwd "${USER}"
+    message "Adding new user to a default list of groups"
+    usermod -aG ftp,users,games,video,kvm,input,audio,rfkill,optical,storage,scanner,wheel "${USER}"
+    message "Adding some useful resources to the home folder"
+    cat << EOF > "/home/${USER}/Linux-tkg Kernel.desktop"
+[Desktop Entry]
+Icon=text-html
+Name=linux-tkg Kernel - Link
+Type=Link
+URL[\$e]=https://github.com/frogging-family/linux-tkg
+EOF
+    cat << EOF > "/home/${USER}/Wine-tkg-git.desktop"
+[Desktop Entry]
+Icon=text-html
+Name=Wine-tkg-git - Link
+Type=Link
+URL[\$e]=https://github.com/frogging-family/wine-tkg-git
+EOF
+  fi
+  
+  ## This fails with a too many arguments error
+  if [ -x "$(command echo "${LATE_PACKAGES}" | grep doas 2>/dev/null)" ] || [ -x "$(command echo "${TOOLS}" | grep doas 2>/dev/null)" ]; then
+    message "Configuring /etc/doas.conf"
+    cat << EOF > /etc/doas.conf
+permit persist :wheel
+permit setenv { -ENV PS1=\$DOAS_PS1 SSH_AUTH_SOCK } :wheel
+permit nopass keepenv setenv { PATH } root as ro
+EOF
+    chmod 0440 /etc/doas.conf
+    message "Configuring /etc/portage/profile/packages"
+    cat << EOF > /etc/portage/profile/packages
+*app-admin/doas
+EOF
+  fi
+  
+  ## This fails with a too many arguments error
+  if [ -x "$(command echo "${LATE_PACKAGES}" | grep sudo 2>/dev/null)"  ] || [ -x "$(command echo "${TOOLS}" | grep sudo 2>/dev/null)" ] || [ -x "$(command ls /usr/bin | grep sudo 1>/dev/null)" ]; then
+    message "Configuring /etc/sudoers"
+    sed -i "s/# %wheel ALL=(ALL:ALL)/%wheel ALL=(ALL:ALL)/" /etc/sudoers
+    # In case the line above uncomments the line below, which we don't want, we're going to check if it was uncommented and re-comment it if it was
+    sed -i "s/%wheel ALL=(ALL:ALL) NOPASSWD: ALL/# %wheel ALL=(ALL:ALL) NOPASSWD: ALL/" /etc/sudoers
+    message "Configuring /etc/portage/profile/packages"
+    cat << EOF > /etc/portage/profile/packages
+*app-admin/sudo
+EOF
+  fi
+  
+  if [ ${MAKE_CLANG_DEFAULT_COMPILER} != true ] || [ "${WORLD_CLANG_TERMS}" != "y" ]; then
+    message "Rebuilding OpenRC with new USE flags"
+    command ${EMERGE} --changed-use --oneshot sys-apps/openrc
+  fi
+  
+## Might not be necessary?
+  message "Installing sys-libs/pam"
+  command ${EMERGE} --oneshot sys-libs/pam
+
+  message "Configuring /etc/environment"
+  cat << EOF > /etc/environment
+#
+# This file is parsed by pam_env module
+#
+# Syntax: simple "KEY=VAL" pairs on separate lines
+#
+
+## Ask GTK programs to use xdg portals
+export GTK_USE_PORTAL=1
+
+## For Wine / Proton
+export WINEESYNC=1
+export WINEFSYNC=1
+export PBA_ENABLE=1
+
+## Enables DrKonqi for all program crashes
+export KDE_COREDUMP_NOTIFY=1
+EOF
+  
+  message "Adding a user configuration script to /etc/env.d/user-configs.sh"
+  cat << EOF > /etc/env.d/user-configs.sh
+#! /bin/bash
+
+
+## In honor of a Gentoo meme:
+alias emerchu="emerge"
+
+## Shortcut for detecting configured build profiles
+alias buildProfiles="ls /etc/portage/env/ | grep compiler"
+
+## Update shortcut
+alias update="emerge -uavDN @world"
+
+## Shortcut for rebuilding the grub configuration
+alias grubRebuild="grub-mkconfig -o /boot/grub/grub.cfg"
+
+## Shortcut for checking if there's present CPU vulnerabilities and their status
+alias vulnerabilities="grep -r . /sys/devices/system/cpu/vulnerabilities/"
+
+## Set SSH storage requests to Kwallet if present
+if [ -n "\${DISPLAY}" ] && [ -f /usr/bin/ksshaskpass ]; then 
+    export SSH_ASKPASS='/usr/bin/ksshaskpass'
+fi
+
+## Set SSH storage requests to Kwallet
+if [ -n "\${DISPLAY/:/}" ] && [ -f /usr/bin/ksshaskpass ]; then 
+    export SSH_ASKPASS='/usr/bin/ksshaskpass'
+fi
+
+## Sets the system editor(s)
+if [ -n "\${DISPLAY/:/}" ] && [ -x "\$(command -v kate > /dev/null 2>&1)" ]; then
+    export EDITOR=/usr/bin/kate
+elif [ -n "\${DISPLAY/:/}" ] && [ -x "\$(command -v code > /dev/null 2>&1)" ]; then
+    export EDITOR=/usr/bin/code
+elif [ -x "\$(command -v nano > /dev/null 2>&1)" ]; then 
+    export EDITOR=/usr/bin/nano;
+fi
+
+## Fix Java 8's lack of HiDPI nonsense
+if [ "\${XDG_CURRENT_DESKTOP}" == "KDE" ]; then
+    export _JAVA_AWT_WM_NONREPARENTING=1;
+else
+    export _JAVA_AWT_WM_NONREPARENTING=0
+fi
+
+## Enable OpenGL over Vulkan via Zink if using the Nvidia proprietary / "Open-GPU" kernel modules for better OpenGL compatibility, potentially at the cost of speed depending on the application
+## (in which case, this should be reported)
+if [ -f /usr/lib/libGLX_mesa.so ] && [ -x "\$(command -v nvidia-smi > /dev/null 2>&1)" ]; then
+    export __GLX_VENDOR_LIBRARY_NAME=mesa
+    export MESA_LOADER_DRIVER_OVERRIDE=zink
+    export GALLIUM_DRIVER=zink
+    ## For some reason I don't understand, this doesn't work     
+#     if [ -d "\$(find /home -type d -iname 'plasma-workspace')" ] && [ ! -f "\$(find /home -type f -iname 'nvidia-zink.sh')"  ]; then
+#         find /home -type d -iname "plasma-workspace" -exec sh -c 'cat << EOF > \$1/env/nvidia-zink.sh
+# #! /usr/bin/bash
+# 
+# if [ -f /usr/lib/libGLX_mesa.so ] && [ -x "\$(command -v nvidia-smi > /dev/null 2>&1)" ]; then
+#     export __GLX_VENDOR_LIBRARY_NAME="mesa"
+#     export MESA_LOADER_DRIVER_OVERRIDE="zink"
+#     export GALLIUM_DRIVER="zink"
+# fi
+# EOF
+# ' ";"
+#         find /home -type f -iname "nvidia-zink.sh" -exec chmod +x ";"
+#     fi
+fi
+
+EOF
+  chmod 755 /etc/env.d/user-configs.sh
+  chmod +x /etc/env.d/user-configs.sh
+  
+  message "Adding a user configuration script to /etc/env.d/wayland.sh"
+  cat << EOF > /etc/env.d/wayland.sh
+#! /usr/bin/bash
+
+if [ -x "\$(command -v kwin_x11 > /dev/null 2>&1)" ]; then
+    if [ "\${XDG_SESSION_TYPE}" == "wayland" ]; then
+
+        ## egl for older Nvidia versions
+        if [ -x "\$(command -v nvidia-smi > /dev/null 2>&1)" ]; then
+            if nvidia-smi -q | grep "Driver Version" | sed 's/Driver Version *: //' -lt "495.44"; then
+                export KWIN_OPENGL_INTERFACE="egl"
+                export QT_QPA_PLATFORM="wayland-egl;xcb"
+                export KWIN_DRM_USE_EGL_STREAMS=1
+            fi
+        else
+            export QT_QPA_PLATFORM="wayland;xcb"
+        fi
+
+        ## Doesn't work for me, for some reason
+        # if [ modinfo /usr/lib/modules/\$(uname -r)/kernel/drivers/video/nvidia.ko | grep ^version | awk '{print \$3}' => 495.44 ]; then
+        #
+        ## GBM for newer Nvidia versions
+        # export QT_QPA_PLATFORM="wayland"
+        # export QT_QPA_PLATFORMTHEME=qt5ct
+        #    
+        # fi
+        
+        export CLUTTER_BACKEND=wayland
+        export SDL_VIDEODRIVER=wayland
+        
+    elif [ "\${XDG_SESSION_TYPE}" == "x11" ]; then
+        export QT_QPA_PLATFORM="xcb"
+        export SDL_VIDEODRIVER=x11
+        export GDK_BACKEND=x11
+        export WINIT_UNIX_BACKEND=x11
+        
+        if [ -x "\$(command -v nvidia-smi > /dev/null 2>&1)" ]; then
+                export KWIN_TRIPLE_BUFFER=1
+        fi
+    fi
+
+fi
+
+## Kwin compositing render setting
+#    O: OpenGL backend (either OpenGL 1, OpenGL 2 or OpenGL ES 2.0)
+#    O1: OpenGL 1 backend (only 4.x)
+#    O2: OpenGL 2 backend
+#    O2ES: OpenGL ES 2 backend (since 5.5)
+#    X: XRender backend (only X11)
+#    Q: QPainter backend (only Wayland)
+#    N: No Compositing (only X11)
+
+if [ "\${XDG_SESSION_TYPE}" == "x11" ]; then
+    export KWIN_COMPOSE=O2
+elif [ "\${XDG_SESSION_TYPE}" == "wayland" ]; then
+    export KWIN_COMPOSE=QPainter
+    if [ "\${KWIN_TRIPLE_BUFFER}" -eq 1 ]; then
+        export KWIN_TRIPLE_BUFFER=0
+    fi
+fi  
+
+EOF
+  chmod 755 /etc/env.d/wayland.sh
+  chmod +x /etc/env.d/wayland.sh
+  
+  case ${GENTOO_DESKTOP} in
+  
+  "y")
+  message "Enabling steam-overlay repo"
+  command eselect repository enable steam-overlay
+  message "Syncing steam-overlay repo"
+  command emaint sync -r steam-overlay
+    
+  if [ "${INSTALL_STEAM}" != "n" ]; then
+    message "Configuring '/etc/portage/package.accept_keywords' and Installing Steam"
+    cat << EOF > /etc/portage/package.accept_keywords
+*/*::steam-overlay
+EOF
+    command ${EMERGE} games-util/steam-meta
+  else
+    message "Configuring '/etc/portage/package.accept_keywords'"
+    cat << EOF > /etc/portage/package.accept_keywords
+*/*::steam-overlay
+EOF
+    message "Configuring /etc/portage/package.mask/steam-overlay"
+  cat << EOF > /etc/portage/package.mask/steam-overlay
+*/*::steam-overlay
+EOF
+  fi
+  ;;
+  
+  "n")
+  ;;
+  esac
+
+  message "Configuring /etc/portage/profile/packages"
+  cat << EOF > /etc/portage/profile/packages
+*sys-fs/btrfs-progs
+*sys-fs/btrfsmaintenance
+*sys-fs/e2fsprogs
+*sys-fs/dosfstools
+*sys-fs/ntfs3g
+*net-wireless/iwd
+*net-wireless/wireless-tools
+*net-misc/dhcpcd
+*app-text/tree
+*sys-apps/pciutils
+*dev-vcs/git
+*sys-apps/portage
+*app-admin/eselect
+*app-eselect/eselect-repository
+*sys-fs/genfstab
+*sys-kernel/linux-firmware
+*sys-kernel/intel-microcode
+*sys-apps/openrc
+*sys-libs/pam
+*app-admin/mcelog
+*games-util/steam-meta::steam-overlay
+*app-shells/bash
+*app-editors/nano
+*sys-devel/gcc
+*sys-devel/clang
+*sys-devel/llvm
+*sys-devel/lld
+*dev-libs/glib
+*sys-libs/glibc
+*sys-libs/musl
+*sys-libs/libcxx
+EOF
+  chmod 755 /etc/portage/profile/packages
+  
+  case ${GENTOO_DESKTOP} in
+  
+  "y")
+  message "Enabling game-related overlay 'tatsh-overlay'"
+  command eselect repository enable tatsh-overlay
+  
+  message "Configuring /etc/portage/package.mask/tatsh-overlay"
+  cat << EOF > /etc/portage/package.mask/tatsh-overlay
+*/*::tatsh-overlay
+EOF
+  chmod 755 /etc/portage/package.mask/tatsh-overlay
+
+  message "Configuring /etc/portage/package.unmask/tatsh-overlay"
+  cat << EOF > /etc/portage/package.unmask/tatsh-overlay
+games-arcade/clone-hero::tatsh-overlay
+games-emulation/rpcs3::tatsh-overlay
+games-emulation/xemu::tatsh-overlay
+games-emulation/yuzu::tatsh-overlay
+games-emulation/ryujinx::tatsh-overlay
+dev-util/flips::tatsh-overlay
+EOF
+  chmod 755 /etc/portage/package.unmask/tatsh-overlay
+
+  message "Configuring /etc/portage/package.env"
+  cat << EOF > /etc/portage/package.env
+games-emulation/rpcs3 compiler-clang-static
+games-emulation/xemu compiler-gcc-static-lto
+EOF
+
+  message "Syncing tatsh-overlay repo"
+  command emaint sync -r tatsh-overlay
+  
+  if [ ${INSTALL_NVIDIA_DRIVER} != false ]; then
+    message "Configuring /etc/portage/package.unmask/tatsh-overlay"
+    cat << EOF > /etc/portage/package.unmask/tatsh-overlay
+media-plugins/nvidia-vaapi-driver::tatsh-overlay
+EOF
+    message "Installing media-plugins/nvidia-vaapi-driver::tatsh-overlay"
+    command ${EMERGE} media-plugins/nvidia-vaapi-driver
+  fi
+
+  if [ "${INSTALL_GAME_EMULATORS}" == true ]; then
+    message "Installing some emulators and a ROM patching utility"
+    command ${EMERGE} --keep-going games-emulation/mgba games-emulation/dolphin games-emulation/xemu games-emulation/pcsx2 games-emulation/rpcs3 dev-util/flips
+    Message "If Switch emulators are desired, choose either yuzu or ryujinx from /etc/portage/package.unmask/tatsh-overlay"
+  fi
+  ;;
+  
+  "n")
+  ;;
+  esac
+  
+  message "Reboot into your newly installed system!"
+  return 0
+}
+
+#exporting necessary functions and variables
+export -f install_gentoo_chroot
+export -f message
+export -f command
+
+export LRED
+export GREEN
+export LCYAN
+export LBLUE
+export LPURPLE
+export DGRAY
+export NC
+
+export DISTRO
+export GENTOO_DESKTOP
+export TIMEZONE
+export AUTODETECT_CPU_ARCH
+export AUTODETECT_CPU_FLAGS
+export CPU_ARCH
+export CPU_FLAGS
+export USE_FLAGS
+export IS_SSD
+export IS_NVME
+export BOOT_PARTITION
+export SWAP_PARTITION
+export ROOT_PARTITION
+export ROOT_FS_TYPE
+export HOSTNAME
+export CFLAGS
+export PACKAGES
+export MAKE_OPTIONS
+export TOOLS
+export LATE_PACKAGES
+export USE_KERNEL_CONFIG
+export INSTALL_INTEL_DRIVER
+export INSTALL_NVIDIA_DRIVER
+export INSTALL_NVIDIA_OPEN_GPU_MODULES
+export INSTALL_NOUVEAU_DRIVER
+export USE_RADEON
+export USED_VIDEO_CARDS
+export INSTALL_WINE
+export INSTALL_STEAM
+export INSTALL_FLATPAK
+export EMERGE_UNATTENDED
+export EMERGE
+export INSTALL_GAME_EMULATORS
+export MAKE_CLANG_DEFAULT_COMPILER
+
+export INSTALL_KDE_PLASMA
+
+./get-latest-stage3
+install_gentoo_prep
